@@ -1,29 +1,47 @@
 /**
- * OpenCode Zen 免费模型反向代理（跨运行时：Cloudflare Workers / Deno / Node）
+ * 免费模型反向代理（双上游，跨运行时：Cloudflare Workers / Deno / Node）
  *
  * 对外暴露 OpenAI 兼容 API：
- *   GET  /v1/models   ← 动态拉取上游列表，仅保留免费模型
+ *   GET  /v1/models   ← 合并两上游免费列表
  *   POST /v1/chat/completions ← 仅允许免费模型，SSE 流式透传
  *
- * 上游：https://opencode.ai/zen/v1
- * 免费通道要求伪装官方 opencode CLI 指纹头 + Authorization: Bearer public；
- * 模型 ID 原样透传（免费模型自带 -free 后缀，另有 stealth 免费模型 big-pickle）。
+ * 上游 1「zen」：https://opencode.ai/zen/v1（默认路由，裸模型 ID）
+ *   免费通道要求伪装官方 opencode CLI 指纹头 + Authorization: Bearer public；
+ *   模型 ID 原样透传（免费模型自带 -free 后缀，另有 stealth 免费模型 big-pickle）。
+ *
+ * 上游 2「cline」：https://api.cline.bot/api/v1（模型 ID 加 cline/ 前缀路由）
+ *   需在 app.cline.bot 注册并生成 API Key（env.CLINE_KEY），
+ *   请求头必须携带 x-client-type: cline-cli；
+ *   免费模型清单来自匿名端点 /ai/cline/recommended-models 的 .free[]。
  */
 
 interface Env {
   API_KEY: string;
   /** 可选：自己的 OpenCode Zen key（BYOK），绕开匿名共享池限流 */
   ZEN_KEY?: string;
+  /** Cline 免费模型的访问 Key（app.cline.bot 注册获取）；调用 cline/* 模型时必填 */
+  CLINE_KEY?: string;
   /** 可选：设为 "0" 关闭模型故障转移（默认开启） */
   FALLBACK?: string;
 }
 
+type UpstreamId = "zen" | "cline";
+
+/** 模型请求解析结果：externalId 为对外完整 ID，upstreamModelId 为发往上游的真实 ID */
+interface ModelRoute {
+  upstream: UpstreamId;
+  externalId: string;
+  upstreamModelId: string;
+}
+
 const UPSTREAM_BASE = "https://opencode.ai/zen/v1";
+const CLINE_BASE = "https://api.cline.bot/api/v1";
+const CLINE_PREFIX = "cline/";
 const CLI_UA = "opencode/1.18.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13";
 const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
 
-/** 上游拉取失败时的兜底免费模型清单 */
-const FALLBACK_FREE_MODELS: ReadonlyArray<string> = [
+/** zen 上游拉取失败时的兜底免费模型清单 */
+const FALLBACK_ZEN_FREE_MODELS: ReadonlyArray<string> = [
   "big-pickle",
   "deepseek-v4-flash-free",
   "x-preview-f-free",
@@ -35,6 +53,30 @@ const FALLBACK_FREE_MODELS: ReadonlyArray<string> = [
   "laguna-s-2.1-free",
 ];
 
+/** cline 上游拉取失败时的兜底免费模型清单 */
+const FALLBACK_CLINE_FREE_MODELS: ReadonlyArray<string> = [
+  "stealth/ox-alpha",
+  "deepseek/deepseek-v4-flash",
+  "poolside/laguna-s-2.1:free",
+];
+
+/** 解析对外模型 ID → 路由目标；带 cline/ 前缀走 cline 上游，其余走 zen */
+function parseModelRoute(model: string): ModelRoute {
+  if (model.startsWith(CLINE_PREFIX)) {
+    return {
+      upstream: "cline",
+      externalId: model,
+      upstreamModelId: model.slice(CLINE_PREFIX.length),
+    };
+  }
+  return { upstream: "zen", externalId: model, upstreamModelId: model };
+}
+
+/** 上游真实 ID ↔ 对外 ID 映射（cline 统一加前缀） */
+function toExternalId(upstream: UpstreamId, upstreamModelId: string): string {
+  return upstream === "zen" ? upstreamModelId : CLINE_PREFIX + upstreamModelId;
+}
+
 /** 不带 -free 后缀但当前免费的模型（stealth 免费模型） */
 const FREE_WITHOUT_SUFFIX = new Set<string>(["big-pickle"]);
 
@@ -43,7 +85,8 @@ function isFreeModelId(id: string): boolean {
 }
 
 /** 模型清单缓存（按 isolate 存活周期） */
-let modelsCache: { ids: string[]; fetchedAt: number } | null = null;
+let zenModelsCache: { ids: string[]; fetchedAt: number } | null = null;
+let clineModelsCache: { ids: string[]; fetchedAt: number } | null = null;
 
 function jsonHeaders(): Headers {
   const h = new Headers();
@@ -96,10 +139,10 @@ function buildUpstreamHeaders(authKey: string | undefined, bodySize?: number): H
   return h;
 }
 
-/** 拉取上游模型清单并过滤出免费模型（带内存缓存；失败回退静态清单） */
-async function getFreeModelIds(authKey: string | undefined): Promise<string[]> {
-  if (modelsCache && Date.now() - modelsCache.fetchedAt < MODELS_CACHE_TTL_MS) {
-    return modelsCache.ids;
+/** 拉取 zen 上游免费模型清单（带内存缓存；失败回退静态清单） */
+async function getZenFreeModelIds(authKey: string | undefined): Promise<string[]> {
+  if (zenModelsCache && Date.now() - zenModelsCache.fetchedAt < MODELS_CACHE_TTL_MS) {
+    return zenModelsCache.ids;
   }
   try {
     const resp = await fetch(`${UPSTREAM_BASE}/models`, { headers: buildUpstreamHeaders(authKey) });
@@ -109,12 +152,39 @@ async function getFreeModelIds(authKey: string | undefined): Promise<string[]> {
       .map((m) => m.id ?? "")
       .filter((id) => id.length > 0 && isFreeModelId(id));
     if (ids.length === 0) throw new Error("no free models in upstream list");
-    modelsCache = { ids, fetchedAt: Date.now() };
+    zenModelsCache = { ids, fetchedAt: Date.now() };
     return ids;
   } catch {
     // 回退到静态清单，不写缓存以便下次重试
-    return [...FALLBACK_FREE_MODELS];
+    return [...FALLBACK_ZEN_FREE_MODELS];
   }
+}
+
+/**
+ * 拉取 cline 上游免费模型清单。
+ * 免费列表端点可匿名访问：GET /ai/cline/recommended-models → .free[].id
+ */
+async function getClineFreeModelIds(): Promise<string[]> {
+  if (clineModelsCache && Date.now() - clineModelsCache.fetchedAt < MODELS_CACHE_TTL_MS) {
+    return clineModelsCache.ids;
+  }
+  try {
+    const resp = await fetch(`${CLINE_BASE}/ai/cline/recommended-models`);
+    if (!resp.ok) throw new Error(`status ${resp.status}`);
+    const data = (await resp.json()) as { free?: Array<{ id?: string }> };
+    const ids = (data.free ?? [])
+      .map((m) => m.id ?? "")
+      .filter((id) => id.length > 0);
+    if (ids.length === 0) throw new Error("no free models in cline list");
+    clineModelsCache = { ids, fetchedAt: Date.now() };
+    return ids;
+  } catch {
+    return [...FALLBACK_CLINE_FREE_MODELS];
+  }
+}
+
+function listUpstreamFreeIds(upstream: UpstreamId, env: Env): Promise<string[]> {
+  return upstream === "zen" ? getZenFreeModelIds(env.ZEN_KEY) : getClineFreeModelIds();
 }
 
 /** 模型健康缓存：上游故障的模型在 TTL 内被标记为不健康（按 isolate 存活周期） */
@@ -147,20 +217,67 @@ function isTransientUpstreamFailure(status: number, bodyText: string): boolean {
 
 async function handleModels(env: Env): Promise<Response> {
   const now = Math.floor(Date.now() / 1000);
-  let ids = await getFreeModelIds(env.ZEN_KEY);
-  // 过滤当前已知不健康的模型；若全部不健康则保留完整列表
-  const healthy = ids.filter(isHealthy);
-  if (healthy.length > 0) ids = healthy;
-  const body = {
-    object: "list",
-    data: ids.map((id) => ({
-      id,
-      object: "model",
-      created: now,
-      owned_by: "opencode-zen-free",
-    })),
+  const sections: Array<{ upstream: UpstreamId; ids: string[] }> = [
+    { upstream: "zen", ids: await getZenFreeModelIds(env.ZEN_KEY) },
+    { upstream: "cline", ids: await getClineFreeModelIds() },
+  ];
+
+  const data: Array<{ id: string; object: string; created: number; owned_by: string }> = [];
+  for (const section of sections) {
+    let ids = section.ids;
+    // 过滤当前已知不健康的模型；若全部不健康则保留完整列表（按上游分别判断）
+    const healthy = ids.filter((id) => isHealthy(toExternalId(section.upstream, id)));
+    if (healthy.length > 0) ids = healthy;
+    for (const id of ids) {
+      data.push({
+        id: toExternalId(section.upstream, id),
+        object: "model",
+        created: now,
+        owned_by: section.upstream === "zen" ? "opencode-zen-free" : "cline-free",
+      });
+    }
+  }
+  return new Response(JSON.stringify({ object: "list", data }), { headers: jsonHeaders() });
+}
+
+/** cline 上游请求头：账号 Key + CLI 客户端标识 */
+function buildClineHeaders(apiKey: string, bodySize?: number): Headers {
+  const h = new Headers();
+  if (bodySize !== undefined) {
+    h.set("content-type", "application/json");
+    h.set("content-length", String(bodySize));
+  }
+  h.set("authorization", `Bearer ${apiKey}`);
+  h.set("accept", "*/*");
+  h.set("x-client-type", "cline-cli");
+  return h;
+}
+
+/** 按上游构造转发目标与请求参数 */
+function buildUpstreamPost(
+  upstream: UpstreamId,
+  env: Env,
+  path: string,
+  bodyText: string,
+): { url: string; init: RequestInit } {
+  if (upstream === "cline") {
+    return {
+      url: `${CLINE_BASE}${path}`,
+      init: {
+        method: "POST",
+        headers: buildClineHeaders(env.CLINE_KEY as string, bodyText.length),
+        body: bodyText,
+      },
+    };
+  }
+  return {
+    url: `${UPSTREAM_BASE}${path}`,
+    init: {
+      method: "POST",
+      headers: buildUpstreamHeaders(env.ZEN_KEY, bodyText.length),
+      body: bodyText,
+    },
   };
-  return new Response(JSON.stringify(body), { headers: jsonHeaders() });
 }
 
 async function handleChat(request: Request, env: Env): Promise<Response> {
@@ -175,41 +292,55 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
     return openaiError("'model' is required.", "invalid_request_error", null, 400);
   }
 
-  // 仅放行免费模型，其余请求不触达上游
-  const allowed = await getFreeModelIds(env.ZEN_KEY);
-  if (!allowed.includes(parsed.model)) {
+  // 路由：cline/ 前缀 → cline 上游；其余 → zen 上游
+  const route = parseModelRoute(parsed.model);
+
+  if (route.upstream === "cline" && !env.CLINE_KEY) {
     return openaiError(
-      `Model '${parsed.model}' not found or not free. Available: ${allowed.join(", ")}`,
+      `Model '${parsed.model}' requires a Cline key. Register free at https://app.cline.bot, create an API key (Account -> API Keys), then set the CLINE_KEY environment variable.`,
+      "invalid_request_error",
+      "missing_upstream_key",
+      400,
+    );
+  }
+
+  // 仅放行免费模型，其余请求不触达上游
+  const allowed = await listUpstreamFreeIds(route.upstream, env);
+  if (!allowed.includes(route.upstreamModelId)) {
+    const display = allowed.map((id) => toExternalId(route.upstream, id));
+    return openaiError(
+      `Model '${parsed.model}' not found or not free. Available: ${display.join(", ")}`,
       "invalid_request_error",
       "model_not_found",
       404,
     );
   }
 
-  // 故障转移：请求的模型当前不健康时，自动切换到健康模型（可用 FALLBACK=0 关闭）
-  let activeModel: string = parsed.model;
-  const requestedUnhealthy = !isHealthy(activeModel);
+  // 故障转移（限同一上游内）：请求的模型当前不健康时自动切换（可用 FALLBACK=0 关闭）
+  let activeExternal: string = route.externalId;
+  let activeModelId: string = route.upstreamModelId;
+  const requestedUnhealthy = !isHealthy(activeExternal);
   let fallbackFrom: string | null = null;
   if (requestedUnhealthy && env.FALLBACK !== "0") {
-    const candidate = allowed.find((id) => id !== activeModel && isHealthy(id));
+    const candidate = allowed.find(
+      (id) => id !== activeModelId && isHealthy(toExternalId(route.upstream, id)),
+    );
     if (candidate) {
-      fallbackFrom = activeModel;
-      activeModel = candidate;
-      parsed.model = candidate;
+      fallbackFrom = activeExternal;
+      activeModelId = candidate;
+      activeExternal = toExternalId(route.upstream, candidate);
     }
   }
+  parsed.model = activeModelId;
 
   const upstreamBody = JSON.stringify(parsed);
 
+  const target = buildUpstreamPost(route.upstream, env, "/chat/completions", upstreamBody);
   let upstream: Response;
   try {
-    upstream = await fetch(`${UPSTREAM_BASE}/chat/completions`, {
-      method: "POST",
-      headers: buildUpstreamHeaders(env.ZEN_KEY, upstreamBody.length),
-      body: upstreamBody,
-    });
+    upstream = await fetch(target.url, target.init);
   } catch (e) {
-    markUnhealthy(activeModel);
+    markUnhealthy(activeExternal);
     return openaiError(`Upstream request failed: ${e instanceof Error ? e.message : "unknown"}`, "api_error", null, 502);
   }
 
@@ -218,28 +349,28 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
   if (!upstream.ok) {
     errorText = await upstream.text();
     if (isTransientUpstreamFailure(upstream.status, errorText)) {
-      markUnhealthy(activeModel);
+      markUnhealthy(activeExternal);
       // 尚未转移过且未禁用转移 → 换一个健康模型重试
       if (!fallbackFrom && env.FALLBACK !== "0") {
-        const candidate = allowed.find((id) => id !== activeModel && isHealthy(id));
+        const candidate = allowed.find(
+          (id) => id !== activeModelId && isHealthy(toExternalId(route.upstream, id)),
+        );
         if (candidate) {
-          fallbackFrom = activeModel;
-          activeModel = candidate;
+          fallbackFrom = activeExternal;
+          activeModelId = candidate;
+          activeExternal = toExternalId(route.upstream, candidate);
           parsed.model = candidate;
           try {
             const retryBody = JSON.stringify(parsed);
-            upstream = await fetch(`${UPSTREAM_BASE}/chat/completions`, {
-              method: "POST",
-              headers: buildUpstreamHeaders(env.ZEN_KEY, retryBody.length),
-              body: retryBody,
-            });
+            const retryTarget = buildUpstreamPost(route.upstream, env, "/chat/completions", retryBody);
+            upstream = await fetch(retryTarget.url, retryTarget.init);
           } catch {
             return openaiError(`Upstream request failed during failover.`, "api_error", null, 502);
           }
         }
       }
     } else {
-      markHealthy(activeModel);
+      markHealthy(activeExternal);
     }
     if (!upstream.ok) {
       const h = jsonHeaders();
@@ -247,7 +378,7 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
       return new Response(errorText, { status: upstream.status, headers: h });
     }
   } else {
-    markHealthy(activeModel);
+    markHealthy(activeExternal);
   }
 
   const contentType = upstream.headers.get("content-type") ?? "application/json";
@@ -255,7 +386,7 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
   const extraHeaders = new Headers();
   extraHeaders.set("access-control-allow-origin", "*");
   if (fallbackFrom !== null) {
-    extraHeaders.set("x-model-fallback", `${fallbackFrom} -> ${activeModel}`);
+    extraHeaders.set("x-model-fallback", `${fallbackFrom} -> ${activeExternal}`);
   }
 
   // 流式：SSE 字节流直接透传，不缓冲
@@ -294,7 +425,11 @@ const worker = {
     // 根路径信息页（免鉴权）
     if (url.pathname === "/" && request.method === "GET") {
       return new Response(
-        JSON.stringify({ service: "opencode-free-proxy", endpoints: ["/v1/models", "/v1/chat/completions"] }),
+        JSON.stringify({
+          service: "opencode-free-proxy",
+          upstreams: ["zen", "cline"],
+          endpoints: ["/v1/models", "/v1/chat/completions"],
+        }),
         { headers: jsonHeaders() },
       );
     }
@@ -345,13 +480,19 @@ if (denoGlobal && isMain) {
     get ZEN_KEY(): string | undefined {
       return denoGlobal.env.get("ZEN_KEY") || undefined;
     },
+    get CLINE_KEY(): string | undefined {
+      return denoGlobal.env.get("CLINE_KEY") || undefined;
+    },
     get FALLBACK(): string | undefined {
       return denoGlobal.env.get("FALLBACK") || undefined;
     },
   };
   const rawPort = denoGlobal.env.get("PORT");
   const port = Number(rawPort ?? "8000");
-  console.log(`[opencode-free-proxy] PORT env="${rawPort ?? "(unset)"}" -> listening on 0.0.0.0:${port} (API_KEY=${denoEnv.API_KEY ? "set" : "missing"}, ZEN_KEY=${denoEnv.ZEN_KEY ? "set" : "public"})`);
+  console.log(
+    `[opencode-free-proxy] PORT env="${rawPort ?? "(unset)"}" -> listening on 0.0.0.0:${port} ` +
+      `(API_KEY=${denoEnv.API_KEY ? "set" : "missing"}, ZEN_KEY=${denoEnv.ZEN_KEY ? "set" : "public"}, CLINE_KEY=${denoEnv.CLINE_KEY ? "set" : "missing"})`,
+  );
   denoGlobal.serve({
     handler: (request: Request) => worker.fetch(request, denoEnv),
     port,
