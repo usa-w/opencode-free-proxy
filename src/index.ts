@@ -280,6 +280,31 @@ function buildUpstreamPost(
   };
 }
 
+/**
+ * Cline 上游非流式响应会把真实载荷包在顶层 `data` 字段里（{"data":{"choices":[...]}}），
+ * 不符合 OpenAI 标准。此处剥壳：以 data 为准合并其余顶层字段后返回标准结构。
+ * 非 JSON 或无包裹时原样返回。
+ */
+function unwrapClineEnvelope(text: string): string {
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    const inner = parsed?.data;
+    if (
+      inner !== null &&
+      typeof inner === "object" &&
+      !Array.isArray(inner) &&
+      Array.isArray((inner as { choices?: unknown }).choices)
+    ) {
+      const merged = { ...parsed, ...(inner as Record<string, unknown>) } as Record<string, unknown>;
+      delete merged.data;
+      return JSON.stringify(merged);
+    }
+  } catch {
+    // 非 JSON，原样返回
+  }
+  return text;
+}
+
 async function handleChat(request: Request, env: Env): Promise<Response> {
   let parsed: { model?: unknown; stream?: unknown };
   try {
@@ -398,8 +423,11 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
     return new Response(upstream.body, { status: 200, headers: h });
   }
 
-  // 非流式：透传 JSON
-  const text = await upstream.text();
+  // 非流式：透传 JSON（cline 上游需剥掉 data 包裹层，归一为标准 OpenAI 结构）
+  let text = await upstream.text();
+  if (route.upstream === "cline" && contentType.includes("application/json")) {
+    text = unwrapClineEnvelope(text);
+  }
   const h = jsonHeaders();
   h.set("content-type", contentType);
   for (const [k, v] of extraHeaders) h.set(k, v);
