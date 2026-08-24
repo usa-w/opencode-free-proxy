@@ -347,6 +347,7 @@ if (denoGlobal) {
     },
   };
   const port = Number(denoGlobal.env.get("PORT") ?? "8000");
+  console.log(`[opencode-free-proxy] listening on 0.0.0.0:${port} (API_KEY=${denoEnv.API_KEY ? "set" : "missing"}, ZEN_KEY=${denoEnv.ZEN_KEY ? "set" : "public"})`);
   denoGlobal.serve((request: Request) => worker.fetch(request, denoEnv), {
     port,
     hostname: "0.0.0.0",
