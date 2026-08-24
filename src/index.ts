@@ -325,16 +325,19 @@ const worker = {
  * Cloudflare Workers 中 globalThis.Deno 不存在，此分支不执行（由 Workers 运行时调用 fetch）。
  */
 type DenoGlobal = {
-  serve: (
-    handler: (request: Request) => Promise<Response> | Response,
-    opts?: { port?: number; hostname?: string },
-  ) => void;
+  serve: (opts: {
+    handler: (request: Request) => Promise<Response> | Response;
+    port?: number;
+    hostname?: string;
+  }) => void;
   env: { get: (key: string) => string | undefined };
 };
 
 const denoGlobal = (globalThis as { Deno?: DenoGlobal }).Deno;
 
-if (denoGlobal) {
+// 仅在直接运行（deno run）时自举
+const isMain = (import.meta as unknown as { main?: boolean }).main;
+if (denoGlobal && isMain) {
   const denoEnv: Env = {
     get API_KEY(): string {
       return denoGlobal.env.get("API_KEY") ?? "";
@@ -346,9 +349,11 @@ if (denoGlobal) {
       return denoGlobal.env.get("FALLBACK") || undefined;
     },
   };
-  const port = Number(denoGlobal.env.get("PORT") ?? "8000");
-  console.log(`[opencode-free-proxy] listening on 0.0.0.0:${port} (API_KEY=${denoEnv.API_KEY ? "set" : "missing"}, ZEN_KEY=${denoEnv.ZEN_KEY ? "set" : "public"})`);
-  denoGlobal.serve((request: Request) => worker.fetch(request, denoEnv), {
+  const rawPort = denoGlobal.env.get("PORT");
+  const port = Number(rawPort ?? "8000");
+  console.log(`[opencode-free-proxy] PORT env="${rawPort ?? "(unset)"}" -> listening on 0.0.0.0:${port} (API_KEY=${denoEnv.API_KEY ? "set" : "missing"}, ZEN_KEY=${denoEnv.ZEN_KEY ? "set" : "public"})`);
+  denoGlobal.serve({
+    handler: (request: Request) => worker.fetch(request, denoEnv),
     port,
     hostname: "0.0.0.0",
   });
