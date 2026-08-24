@@ -1,0 +1,356 @@
+/**
+ * OpenCode Zen 免费模型反向代理（跨运行时：Cloudflare Workers / Deno / Node）
+ *
+ * 对外暴露 OpenAI 兼容 API：
+ *   GET  /v1/models   ← 动态拉取上游列表，仅保留免费模型
+ *   POST /v1/chat/completions ← 仅允许免费模型，SSE 流式透传
+ *
+ * 上游：https://opencode.ai/zen/v1
+ * 免费通道要求伪装官方 opencode CLI 指纹头 + Authorization: Bearer public；
+ * 模型 ID 原样透传（免费模型自带 -free 后缀，另有 stealth 免费模型 big-pickle）。
+ */
+
+interface Env {
+  API_KEY: string;
+  /** 可选：自己的 OpenCode Zen key（BYOK），绕开匿名共享池限流 */
+  ZEN_KEY?: string;
+  /** 可选：设为 "0" 关闭模型故障转移（默认开启） */
+  FALLBACK?: string;
+}
+
+const UPSTREAM_BASE = "https://opencode.ai/zen/v1";
+const CLI_UA = "opencode/1.18.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13";
+const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/** 上游拉取失败时的兜底免费模型清单 */
+const FALLBACK_FREE_MODELS: ReadonlyArray<string> = [
+  "big-pickle",
+  "deepseek-v4-flash-free",
+  "x-preview-f-free",
+  "muse-spark-1.2-contributor-free",
+  "mimo-v2.5-free",
+  "hy3-free",
+  "nemotron-3-ultra-free",
+  "nemotron-3.5-lightning-free",
+  "laguna-s-2.1-free",
+];
+
+/** 不带 -free 后缀但当前免费的模型（stealth 免费模型） */
+const FREE_WITHOUT_SUFFIX = new Set<string>(["big-pickle"]);
+
+function isFreeModelId(id: string): boolean {
+  return id.endsWith("-free") || FREE_WITHOUT_SUFFIX.has(id);
+}
+
+/** 模型清单缓存（按 isolate 存活周期） */
+let modelsCache: { ids: string[]; fetchedAt: number } | null = null;
+
+function jsonHeaders(): Headers {
+  const h = new Headers();
+  h.set("content-type", "application/json");
+  h.set("access-control-allow-origin", "*");
+  return h;
+}
+
+function openaiError(message: string, type: string, code: string | null, status: number): Response {
+  return new Response(
+    JSON.stringify({ error: { message, type, param: null, code } }),
+    { status, headers: jsonHeaders() },
+  );
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** 校验 Bearer 密钥（两侧哈希后比较） */
+async function isAuthorized(request: Request, env: Env): Promise<boolean> {
+  const auth = request.headers.get("authorization") ?? "";
+  if (!auth.startsWith("Bearer ")) return false;
+  const given = await sha256Hex(auth.slice("Bearer ".length));
+  const expected = await sha256Hex(env.API_KEY);
+  return given === expected;
+}
+
+/**
+ * 构造上游请求头：伪装官方 opencode CLI 指纹。
+ * 认证：优先 BYOK（env.ZEN_KEY），否则匿名 `Bearer public`（受共享池限流）。
+ * - x-opencode-session：按天确定（同一天不变）
+ * - x-opencode-request：每次请求新生成
+ */
+function buildUpstreamHeaders(authKey: string | undefined, bodySize?: number): Headers {
+  const today = new Date().toISOString().slice(0, 10);
+  const h = new Headers();
+  if (bodySize !== undefined) {
+    h.set("content-type", "application/json");
+    h.set("content-length", String(bodySize));
+  }
+  h.set("authorization", authKey ? `Bearer ${authKey}` : "Bearer public");
+  h.set("user-agent", CLI_UA);
+  h.set("accept", "*/*");
+  h.set("x-opencode-client", "cli");
+  h.set("x-opencode-project", "global");
+  h.set("x-opencode-session", `ses_${crypto.randomUUID()}`);
+  h.set("x-opencode-request", `msg_${crypto.randomUUID()}`);
+  return h;
+}
+
+/** 拉取上游模型清单并过滤出免费模型（带内存缓存；失败回退静态清单） */
+async function getFreeModelIds(authKey: string | undefined): Promise<string[]> {
+  if (modelsCache && Date.now() - modelsCache.fetchedAt < MODELS_CACHE_TTL_MS) {
+    return modelsCache.ids;
+  }
+  try {
+    const resp = await fetch(`${UPSTREAM_BASE}/models`, { headers: buildUpstreamHeaders(authKey) });
+    if (!resp.ok) throw new Error(`status ${resp.status}`);
+    const data = (await resp.json()) as { data?: Array<{ id?: string }> };
+    const ids = (data.data ?? [])
+      .map((m) => m.id ?? "")
+      .filter((id) => id.length > 0 && isFreeModelId(id));
+    if (ids.length === 0) throw new Error("no free models in upstream list");
+    modelsCache = { ids, fetchedAt: Date.now() };
+    return ids;
+  } catch {
+    // 回退到静态清单，不写缓存以便下次重试
+    return [...FALLBACK_FREE_MODELS];
+  }
+}
+
+/** 模型健康缓存：上游故障的模型在 TTL 内被标记为不健康（按 isolate 存活周期） */
+const UNHEALTHY_TTL_MS = 10 * 60 * 1000;
+const modelHealth = new Map<string, number>();
+
+function markUnhealthy(id: string): void {
+  modelHealth.set(id, Date.now() + UNHEALTHY_TTL_MS);
+}
+
+function markHealthy(id: string): void {
+  modelHealth.delete(id);
+}
+
+function isHealthy(id: string): boolean {
+  const until = modelHealth.get(id);
+  if (until === undefined) return true;
+  if (Date.now() > until) {
+    modelHealth.delete(id);
+    return true;
+  }
+  return false;
+}
+
+/** 上游错误是否值得触发故障转移/健康标记（客户端错误除外） */
+function isTransientUpstreamFailure(status: number, bodyText: string): boolean {
+  if (status === 429 || status >= 500) return true;
+  return /unavailable|Internal server error|FreeUsageLimit/i.test(bodyText);
+}
+
+async function handleModels(env: Env): Promise<Response> {
+  const now = Math.floor(Date.now() / 1000);
+  let ids = await getFreeModelIds(env.ZEN_KEY);
+  // 过滤当前已知不健康的模型；若全部不健康则保留完整列表
+  const healthy = ids.filter(isHealthy);
+  if (healthy.length > 0) ids = healthy;
+  const body = {
+    object: "list",
+    data: ids.map((id) => ({
+      id,
+      object: "model",
+      created: now,
+      owned_by: "opencode-zen-free",
+    })),
+  };
+  return new Response(JSON.stringify(body), { headers: jsonHeaders() });
+}
+
+async function handleChat(request: Request, env: Env): Promise<Response> {
+  let parsed: { model?: unknown; stream?: unknown };
+  try {
+    parsed = JSON.parse(await request.text());
+  } catch {
+    return openaiError("Request body is not valid JSON.", "invalid_request_error", null, 400);
+  }
+
+  if (typeof parsed?.model !== "string" || parsed.model.length === 0) {
+    return openaiError("'model' is required.", "invalid_request_error", null, 400);
+  }
+
+  // 仅放行免费模型，其余请求不触达上游
+  const allowed = await getFreeModelIds(env.ZEN_KEY);
+  if (!allowed.includes(parsed.model)) {
+    return openaiError(
+      `Model '${parsed.model}' not found or not free. Available: ${allowed.join(", ")}`,
+      "invalid_request_error",
+      "model_not_found",
+      404,
+    );
+  }
+
+  // 故障转移：请求的模型当前不健康时，自动切换到健康模型（可用 FALLBACK=0 关闭）
+  let activeModel: string = parsed.model;
+  const requestedUnhealthy = !isHealthy(activeModel);
+  let fallbackFrom: string | null = null;
+  if (requestedUnhealthy && env.FALLBACK !== "0") {
+    const candidate = allowed.find((id) => id !== activeModel && isHealthy(id));
+    if (candidate) {
+      fallbackFrom = activeModel;
+      activeModel = candidate;
+      parsed.model = candidate;
+    }
+  }
+
+  const upstreamBody = JSON.stringify(parsed);
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${UPSTREAM_BASE}/chat/completions`, {
+      method: "POST",
+      headers: buildUpstreamHeaders(env.ZEN_KEY, upstreamBody.length),
+      body: upstreamBody,
+    });
+  } catch (e) {
+    markUnhealthy(activeModel);
+    return openaiError(`Upstream request failed: ${e instanceof Error ? e.message : "unknown"}`, "api_error", null, 502);
+  }
+
+  // 错误响应：标记健康状态；若为上游侧故障则尝试故障转移一次
+  let errorText: string | null = null;
+  if (!upstream.ok) {
+    errorText = await upstream.text();
+    if (isTransientUpstreamFailure(upstream.status, errorText)) {
+      markUnhealthy(activeModel);
+      // 尚未转移过且未禁用转移 → 换一个健康模型重试
+      if (!fallbackFrom && env.FALLBACK !== "0") {
+        const candidate = allowed.find((id) => id !== activeModel && isHealthy(id));
+        if (candidate) {
+          fallbackFrom = activeModel;
+          activeModel = candidate;
+          parsed.model = candidate;
+          try {
+            const retryBody = JSON.stringify(parsed);
+            upstream = await fetch(`${UPSTREAM_BASE}/chat/completions`, {
+              method: "POST",
+              headers: buildUpstreamHeaders(env.ZEN_KEY, retryBody.length),
+              body: retryBody,
+            });
+          } catch {
+            return openaiError(`Upstream request failed during failover.`, "api_error", null, 502);
+          }
+        }
+      }
+    } else {
+      markHealthy(activeModel);
+    }
+    if (!upstream.ok) {
+      const h = jsonHeaders();
+      h.set("content-type", upstream.headers.get("content-type") ?? "application/json");
+      return new Response(errorText, { status: upstream.status, headers: h });
+    }
+  } else {
+    markHealthy(activeModel);
+  }
+
+  const contentType = upstream.headers.get("content-type") ?? "application/json";
+
+  const extraHeaders = new Headers();
+  extraHeaders.set("access-control-allow-origin", "*");
+  if (fallbackFrom !== null) {
+    extraHeaders.set("x-model-fallback", `${fallbackFrom} -> ${activeModel}`);
+  }
+
+  // 流式：SSE 字节流直接透传，不缓冲
+  if (parsed.stream === true && upstream.body !== null) {
+    const h = new Headers();
+    h.set("content-type", contentType);
+    h.set("cache-control", "no-cache");
+    for (const [k, v] of extraHeaders) h.set(k, v);
+    return new Response(upstream.body, { status: 200, headers: h });
+  }
+
+  // 非流式：透传 JSON
+  const text = await upstream.text();
+  const h = jsonHeaders();
+  h.set("content-type", contentType);
+  for (const [k, v] of extraHeaders) h.set(k, v);
+  return new Response(text, { status: upstream.status, headers: h });
+}
+
+const worker = {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, POST, OPTIONS",
+          "access-control-allow-headers": "authorization, content-type",
+          "access-control-max-age": "86400",
+        },
+      });
+    }
+
+    // 根路径信息页（免鉴权）
+    if (url.pathname === "/" && request.method === "GET") {
+      return new Response(
+        JSON.stringify({ service: "opencode-free-proxy", endpoints: ["/v1/models", "/v1/chat/completions"] }),
+        { headers: jsonHeaders() },
+      );
+    }
+
+    if (!(await isAuthorized(request, env))) {
+      return openaiError(
+        "Invalid or missing API key. Send 'Authorization: Bearer <key>'.",
+        "invalid_request_error",
+        "invalid_api_key",
+        401,
+      );
+    }
+
+    if (url.pathname === "/v1/models" && request.method === "GET") {
+      return handleModels(env);
+    }
+
+    if (url.pathname === "/v1/chat/completions" && request.method === "POST") {
+      return handleChat(request, env);
+    }
+
+    return openaiError(`Unknown endpoint: ${request.method} ${url.pathname}`, "invalid_request_error", null, 404);
+  },
+};
+
+/**
+ * 运行时自举：Deno 环境下直接启动服务，环境变量经 Deno.env 按请求读取。
+ * Cloudflare Workers 中 globalThis.Deno 不存在，此分支不执行（由 Workers 运行时调用 fetch）。
+ */
+type DenoGlobal = {
+  serve: (
+    handler: (request: Request) => Promise<Response> | Response,
+    opts?: { port?: number; hostname?: string },
+  ) => void;
+  env: { get: (key: string) => string | undefined };
+};
+
+const denoGlobal = (globalThis as { Deno?: DenoGlobal }).Deno;
+
+if (denoGlobal) {
+  const denoEnv: Env = {
+    get API_KEY(): string {
+      return denoGlobal.env.get("API_KEY") ?? "";
+    },
+    get ZEN_KEY(): string | undefined {
+      return denoGlobal.env.get("ZEN_KEY") || undefined;
+    },
+    get FALLBACK(): string | undefined {
+      return denoGlobal.env.get("FALLBACK") || undefined;
+    },
+  };
+  const port = Number(denoGlobal.env.get("PORT") ?? "8000");
+  denoGlobal.serve((request: Request) => worker.fetch(request, denoEnv), {
+    port,
+    hostname: "0.0.0.0",
+  });
+}
+
+export default worker;

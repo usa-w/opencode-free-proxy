@@ -1,0 +1,24 @@
+{
+  "nodeModulesDir": "none",
+  "minimumDependencyAge": 0,
+  "deploy": {
+    "org": "usa-w",
+    "app": "opencode-free-proxy",
+    "entrypoint": "src/index.ts",
+    "exclude": [
+      "node_modules",
+      ".wrangler",
+      ".dev.vars",
+      ".gitignore",
+      "package.json",
+      "package-lock.json",
+      "tsconfig.json",
+      "wrangler.jsonc",
+      "tsconfig.cf.json"
+    ]
+  }
+}
+
+
+
+
