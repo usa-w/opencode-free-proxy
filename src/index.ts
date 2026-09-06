@@ -40,23 +40,26 @@ const CLINE_PREFIX = "cline/";
 const CLI_UA = "opencode/1.18.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13";
 const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
 
-/** zen 上游拉取失败时的兜底免费模型清单 */
+/** zen 上游拉取失败时的兜底免费模型清单（同步自 i-code v0.3.6 + 上游实测） */
 const FALLBACK_ZEN_FREE_MODELS: ReadonlyArray<string> = [
   "big-pickle",
   "deepseek-v4-flash-free",
   "x-preview-f-free",
   "muse-spark-1.2-contributor-free",
+  "muse-spark-1.3-contributor-free",
   "mimo-v2.5-free",
   "hy3-free",
   "nemotron-3-ultra-free",
   "nemotron-3.5-lightning-free",
   "laguna-s-2.1-free",
+  "ling-3.0-flash-fin-free",
 ];
 
-/** cline 上游拉取失败时的兜底免费模型清单 */
+/** cline 上游拉取失败时的兜底免费模型清单（同步自 recommended-models 实测） */
 const FALLBACK_CLINE_FREE_MODELS: ReadonlyArray<string> = [
-  "stealth/ox-alpha",
   "deepseek/deepseek-v4-flash",
+  "z-ai/glm-5.3-flash",
+  "cline-free/longcat-2.0",
   "poolside/laguna-s-2.1:free",
 ];
 
