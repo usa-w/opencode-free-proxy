@@ -57,8 +57,10 @@ const FALLBACK_ZEN_FREE_MODELS: ReadonlyArray<string> = [
 
 /** cline 上游拉取失败时的兜底免费模型清单（同步自 recommended-models 实测） */
 const FALLBACK_CLINE_FREE_MODELS: ReadonlyArray<string> = [
+  "cline-free/muse-spark-1.3-contributor",
   "deepseek/deepseek-v4-flash",
   "z-ai/glm-5.3-flash",
+  "cline-free/solar-pro4",
   "cline-free/longcat-2.0",
   "poolside/laguna-s-2.1:free",
 ];
