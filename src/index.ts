@@ -150,6 +150,19 @@ function buildUpstreamHeaders(authKey: string | undefined, bodySize?: number): H
   return h;
 }
 
+/** cline 上游请求头：账号 Key + CLI 客户端标识 */
+function buildClineHeaders(apiKey: string, bodySize?: number): Headers {
+  const h = new Headers();
+  if (bodySize !== undefined) {
+    h.set("content-type", "application/json");
+    h.set("content-length", String(bodySize));
+  }
+  h.set("authorization", `Bearer ${apiKey}`);
+  h.set("accept", "*/*");
+  h.set("x-client-type", "cline-cli");
+  return h;
+}
+
 /** 拉取 zen 上游免费模型清单（带内存缓存；失败回退静态清单） */
 async function getZenFreeModelIds(authKey: string | undefined): Promise<string[]> {
   if (zenModelsCache && Date.now() - zenModelsCache.fetchedAt < MODELS_CACHE_TTL_MS) {
