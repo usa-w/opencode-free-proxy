@@ -301,22 +301,22 @@ async function handleModels(env: Env): Promise<Response> {
   return new Response(JSON.stringify({ object: "list", data }), { headers: jsonHeaders() });
 }
 
-/** zen 上游合规化请求体（i-code v0.3.8 要求）：
- * 1. 强制 stream: true（非流式直接拦截报错）
+/** zen 上游合规化请求体（i-code v0.3.8 要求，代理侧自动兼容非流式）：
+ * 1. 自动补 stream: true（上游仅接受流式；客户端非流式则代理聚合后还原）
  * 2. tools 必须存在、≥2 个且含 bash——缺失则自动注入最小化工具
+ * 返回 { bodyText, wasStream } 供外层决定是否聚合
  */
-function prepareZenBody(bodyText: string): string {
+function prepareZenBody(bodyText: string): { bodyText: string; wasStream: boolean } {
   let body: Record<string, unknown>;
   try {
     body = JSON.parse(bodyText) as Record<string, unknown>;
   } catch {
-    return bodyText; // 非 JSON，原样透传
+    return { bodyText, wasStream: true }; // 非 JSON，按流式透传
   }
 
-  // 1. 强制流式：非流式入口直接报错（不再静默改写/聚合）
-  if (body.stream !== true) {
-    throw new Error("OpenCode Free 通道仅支持流式请求（stream 必须为 true），请携带 \"stream\": true 后重试。");
-  }
+  const wasStream = body.stream === true;
+  // 1. 上游强制流式：缺省/False 自动补 true，记录原值供聚合判断
+  if (!wasStream) body.stream = true;
 
   // 2. tools 合规化
   const tools = body.tools;
@@ -358,7 +358,47 @@ function prepareZenBody(bodyText: string): string {
     body.tools = finalTools;
   }
 
-  return JSON.stringify(body);
+  return { bodyText: JSON.stringify(body), wasStream };
+}
+
+/** 将上游 SSE 流聚合成 OpenAI 非流式 JSON（供客户端 stream:false 时还原） */
+async function aggregateSseToJson(sseText: string, fallbackModel: string): Promise<string> {
+  const lines = sseText.split("\n");
+  let content = "";
+  let role: string | undefined;
+  let id: string | undefined;
+  let model: string | undefined;
+  let finishReason: string | null = null;
+  let usage: unknown | undefined;
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t.startsWith("data:")) continue;
+    const data = t.slice(5).trim();
+    if (data === "[DONE]") break;
+    try {
+      const j = JSON.parse(data) as Record<string, unknown>;
+      if (!id && typeof j.id === "string") id = j.id as string;
+      if (!model && typeof j.model === "string") model = j.model as string;
+      const choices = (j.choices as Array<Record<string, unknown>> | undefined);
+      const c0 = choices?.[0] as Record<string, unknown> | undefined;
+      if (c0) {
+        const delta = c0.delta as Record<string, unknown> | undefined;
+        if (delta && typeof delta.content === "string") content += delta.content as string;
+        if (delta && typeof delta.role === "string" && !role) role = delta.role as string;
+        if (typeof c0.finish_reason === "string") finishReason = c0.finish_reason as string;
+      }
+      if (j.usage) usage = j.usage;
+    } catch { /* ignore */ }
+  }
+  const now = Math.floor(Date.now() / 1000);
+  return JSON.stringify({
+    id: id ?? `chatcmpl-${crypto.randomUUID()}`,
+    object: "chat.completion",
+    created: now,
+    model: model ?? fallbackModel,
+    choices: [{ index: 0, message: { role: role ?? "assistant", content }, finish_reason: finishReason ?? "stop", logprobs: null }],
+    usage: usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
 }
 
 /** 按上游构造转发目标与请求参数 */
@@ -378,8 +418,8 @@ function buildUpstreamPost(
       },
     };
   }
-  // zen：应用合规化（强制流式 + tools 注入）
-  const compliantBody = prepareZenBody(bodyText);
+  // zen：应用合规化（强制流式 + tools 注入）；记录原 stream 供外层聚合判断
+  const { bodyText: compliantBody, wasStream } = prepareZenBody(bodyText);
   return {
     url: `${UPSTREAM_BASE}${path}`,
     init: {
@@ -387,7 +427,8 @@ function buildUpstreamPost(
       headers: buildUpstreamHeaders(env.ZEN_KEY, compliantBody.length),
       body: compliantBody,
     },
-  };
+    wasStream,
+  } as { url: string; init: RequestInit; wasStream: boolean };
 }
 
 /**
@@ -470,17 +511,9 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
 
   const upstreamBody = JSON.stringify(parsed);
 
-  let target: { url: string; init: RequestInit };
-  try {
-    target = buildUpstreamPost(route.upstream, env, "/chat/completions", upstreamBody);
-  } catch (e) {
-    // prepareZenBody 强制流式拦截（i-code v0.3.8：非流式直接 400）
-    const msg = e instanceof Error ? e.message : "invalid request";
-    if (msg.includes("仅支持流式")) {
-      return openaiError(msg, "invalid_request_error", "bad_request", 400);
-    }
-    return openaiError(msg, "invalid_request_error", null, 400);
-  }
+  const targetWithMeta = buildUpstreamPost(route.upstream, env, "/chat/completions", upstreamBody) as { url: string; init: RequestInit; wasStream?: boolean };
+  const target: { url: string; init: RequestInit } = { url: targetWithMeta.url, init: targetWithMeta.init };
+  const clientWantsStream = targetWithMeta.wasStream ?? (parsed.stream === true);
   let upstream: Response;
   try {
     upstream = await fetch(target.url, target.init);
@@ -507,12 +540,8 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
           parsed.model = candidate;
           try {
             const retryBody = JSON.stringify(parsed);
-            let retryTarget: { url: string; init: RequestInit };
-            try {
-              retryTarget = buildUpstreamPost(route.upstream, env, "/chat/completions", retryBody);
-            } catch (e2) {
-              return openaiError(e2 instanceof Error ? e2.message : "invalid request", "invalid_request_error", null, 400);
-            }
+            const retryTargetRaw = buildUpstreamPost(route.upstream, env, "/chat/completions", retryBody) as { url: string; init: RequestInit; wasStream?: boolean };
+            const retryTarget: { url: string; init: RequestInit } = { url: retryTargetRaw.url, init: retryTargetRaw.init };
             upstream = await fetch(retryTarget.url, retryTarget.init);
           } catch {
             return openaiError(`Upstream request failed during failover.`, "api_error", null, 502);
@@ -539,8 +568,28 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
     extraHeaders.set("x-model-fallback", `${fallbackFrom} -> ${activeExternal}`);
   }
 
+  const isZen = route.upstream === "zen";
+  const shouldStreamPassthrough = clientWantsStream && upstream.body !== null;
+
+  // zen 非流式：上游恒为 SSE，需聚合还原为 JSON
+  if (isZen && !clientWantsStream) {
+    const sseText = await upstream.text();
+    // 上游错误（非 2xx 已在上方处理），此处为成功 SSE，聚合后返回
+    if (contentType.includes("text/event-stream") || sseText.includes("data:")) {
+      const aggregated = await aggregateSseToJson(sseText, activeModelId);
+      const h = jsonHeaders();
+      for (const [k, v] of extraHeaders) h.set(k, v);
+      return new Response(aggregated, { status: 200, headers: h });
+    }
+    // 非 SSE（如错误 JSON），直接透传
+    const h = jsonHeaders();
+    h.set("content-type", contentType);
+    for (const [k, v] of extraHeaders) h.set(k, v);
+    return new Response(sseText, { status: upstream.status, headers: h });
+  }
+
   // 流式：SSE 字节流直接透传，不缓冲
-  if (parsed.stream === true && upstream.body !== null) {
+  if (shouldStreamPassthrough) {
     const h = new Headers();
     h.set("content-type", contentType);
     h.set("cache-control", "no-cache");
@@ -548,7 +597,7 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
     return new Response(upstream.body, { status: 200, headers: h });
   }
 
-  // 非流式：透传 JSON（cline 上游需剥掉 data 包裹层，归一为标准 OpenAI 结构）
+  // 非流式（cline 等）：透传 JSON（cline 上游需剥掉 data 包裹层，归一为标准 OpenAI 结构）
   let text = await upstream.text();
   if (route.upstream === "cline" && contentType.includes("application/json")) {
     text = unwrapClineEnvelope(text);
