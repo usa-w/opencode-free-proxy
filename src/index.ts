@@ -118,16 +118,47 @@ async function isAuthorized(request: Request, env: Env): Promise<boolean> {
   return given === expected;
 }
 
-/** 按天固定的会话 ID：同一天内不变，跨天自动轮换（符合 OpenCode CLI 格式） */
-let dailySessionCache: { day: string; id: string } | null = null;
+/** OpenCode ID 生成（i-code v0.3.8 对齐：snowflake 时间戳 + base62 随机，非 UUID）
+ * 算法：v = now_ms * 4096 + ctr；session 取反；低 48 位 → 12 hex；+ 14 base62
+ */
+const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+let opencodeCtr = 0;
+let opencodeLastMs = 0;
 
+function generateOpencodeId(negate: boolean): string {
+  const nowMs = Date.now();
+  if (opencodeLastMs !== nowMs) {
+    opencodeLastMs = nowMs;
+    opencodeCtr = 1;
+  } else {
+    opencodeCtr++;
+  }
+  let v = BigInt(nowMs) * 4096n + BigInt(opencodeCtr);
+  if (negate) v = ~v;
+  // 低 48 位 → 12 hex
+  const low48 = v & 0xFFFF_FFFF_FFFFFn;
+  const tsPart = low48.toString(16).padStart(12, "0");
+  // 14 base62 随机
+  const arr = new Uint8Array(14);
+  crypto.getRandomValues(arr);
+  let randPart = "";
+  for (const b of arr) randPart += BASE62[b % 62];
+  return tsPart + randPart;
+}
+
+/** 会话 ID：当天固定（ses_ 前缀） */
+let dailySessionCache: { day: string; id: string } | null = null;
 function dailySessionId(): string {
   const day = new Date().toISOString().slice(0, 10);
   if (dailySessionCache && dailySessionCache.day === day) return dailySessionCache.id;
-  // 生成标准 UUID v4 格式的 ses_ 前缀 ID（模拟 CLI 本地生成并缓存一天）
-  const uuid = crypto.randomUUID();
-  dailySessionCache = { day, id: `ses_${uuid}` };
-  return dailySessionCache.id;
+  const id = `ses_${generateOpencodeId(true)}`;
+  dailySessionCache = { day, id };
+  return id;
+}
+
+/** 请求 ID：每次刷新（msg_ 前缀） */
+function requestId(): string {
+  return `msg_${generateOpencodeId(false)}`;
 }
 
 /**
@@ -148,7 +179,7 @@ function buildUpstreamHeaders(authKey: string | undefined, bodySize?: number): H
   h.set("x-opencode-client", "cli");
   h.set("x-opencode-project", "global");
   h.set("x-opencode-session", dailySessionId());
-  h.set("x-opencode-request", `msg_${crypto.randomUUID()}`);
+  h.set("x-opencode-request", requestId());
   return h;
 }
 
