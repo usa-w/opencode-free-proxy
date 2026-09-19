@@ -119,9 +119,11 @@ async function isAuthorized(request: Request, env: Env): Promise<boolean> {
 }
 
 /** OpenCode ID 生成（i-code v0.3.8 对齐：snowflake 时间戳 + base62 随机，非 UUID）
- * 算法：v = now_ms * 4096 + ctr；session 取反；低 48 位 → 12 hex；+ 14 base62
+ * 算法：v = (now_ms % 2^36) * 4096 + ctr；session 取反；低 48 位 → 12 hex；+ 14 base62
+ * 上游只校验低 36 位时间戳（now_ms % 2^36），通过 (id >> 12) 还原
  */
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const MS_MOD = 1n << 36n; // 2^36
 let opencodeCtr = 0;
 let opencodeLastMs = 0;
 
@@ -133,7 +135,9 @@ function generateOpencodeId(negate: boolean): string {
   } else {
     opencodeCtr++;
   }
-  let v = BigInt(nowMs) * 4096n + BigInt(opencodeCtr);
+  // 只保留低 36 位毫秒（与上游校验逻辑一致）
+  const msLow36 = BigInt(nowMs) % MS_MOD;
+  let v = msLow36 * 4096n + BigInt(opencodeCtr);
   if (negate) v = ~v;
   // 低 48 位 → 12 hex
   const low48 = v & 0xFFFF_FFFF_FFFFFn;
