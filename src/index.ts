@@ -118,14 +118,16 @@ async function isAuthorized(request: Request, env: Env): Promise<boolean> {
   return given === expected;
 }
 
-/** 按天固定的会话 ID：同一天内不变，跨天自动轮换 */
+/** 按天固定的会话 ID：同一天内不变，跨天自动轮换（符合 OpenCode CLI 格式） */
+let dailySessionCache: { day: string; id: string } | null = null;
+
 function dailySessionId(): string {
-  const day = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-  // 基于日期的固定种子，生成确定性 UUID
-  let hash = 0;
-  for (let i = 0; i < day.length; i++) hash = ((hash << 5) - hash) + day.charCodeAt(i);
-  const hex = Math.abs(hash).toString(16).padStart(8, "0");
-  return `ses_${hex}-${hex.slice(0,4)}-4${hex.slice(4,7)}-8${hex.slice(7,10)}-${hex.slice(10,22).padStart(12,"0")}`;
+  const day = new Date().toISOString().slice(0, 10);
+  if (dailySessionCache && dailySessionCache.day === day) return dailySessionCache.id;
+  // 生成标准 UUID v4 格式的 ses_ 前缀 ID（模拟 CLI 本地生成并缓存一天）
+  const uuid = crypto.randomUUID();
+  dailySessionCache = { day, id: `ses_${uuid}` };
+  return dailySessionCache.id;
 }
 
 /**
