@@ -37,22 +37,19 @@ interface ModelRoute {
 const UPSTREAM_BASE = "https://opencode.ai/zen/v1";
 const CLINE_BASE = "https://api.cline.bot/api/v1";
 const CLINE_PREFIX = "cline/";
-const CLI_UA = "opencode/1.18.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13";
+const CLI_UA = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14";
 const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
 
-/** zen 上游拉取失败时的兜底免费模型清单（同步自 i-code v0.3.6 + 上游实测） */
+/** zen 上游拉取失败时的兜底免费模型清单（同步自上游实测 2026-09） */
 const FALLBACK_ZEN_FREE_MODELS: ReadonlyArray<string> = [
-  "big-pickle",
+  "jev-1.13-free",
   "deepseek-v4-flash-free",
-  "x-preview-f-free",
-  "muse-spark-1.2-contributor-free",
   "muse-spark-1.3-contributor-free",
+  "muse-spark-1.2-contributor-free",
   "mimo-v2.5-free",
-  "hy3-free",
+  "ling-3.0-flash-fin-free",
   "nemotron-3-ultra-free",
   "nemotron-3.5-lightning-free",
-  "laguna-s-2.1-free",
-  "ling-3.0-flash-fin-free",
 ];
 
 /** cline 上游拉取失败时的兜底免费模型清单（同步自 recommended-models 实测） */
@@ -121,14 +118,23 @@ async function isAuthorized(request: Request, env: Env): Promise<boolean> {
   return given === expected;
 }
 
+/** 按天固定的会话 ID：同一天内不变，跨天自动轮换 */
+function dailySessionId(): string {
+  const day = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  // 基于日期的固定种子，生成确定性 UUID
+  let hash = 0;
+  for (let i = 0; i < day.length; i++) hash = ((hash << 5) - hash) + day.charCodeAt(i);
+  const hex = Math.abs(hash).toString(16).padStart(8, "0");
+  return `ses_${hex}-${hex.slice(0,4)}-4${hex.slice(4,7)}-8${hex.slice(7,10)}-${hex.slice(10,22).padStart(12,"0")}`;
+}
+
 /**
- * 构造上游请求头：伪装官方 opencode CLI 指纹。
+ * 构造上游请求头：伪装官方 opencode CLI 指纹（i-code v0.3.8 合规）。
  * 认证：优先 BYOK（env.ZEN_KEY），否则匿名 `Bearer public`（受共享池限流）。
- * - x-opencode-session：按天确定（同一天不变）
+ * - x-opencode-session：按天固定（同一天不变）
  * - x-opencode-request：每次请求新生成
  */
 function buildUpstreamHeaders(authKey: string | undefined, bodySize?: number): Headers {
-  const today = new Date().toISOString().slice(0, 10);
   const h = new Headers();
   if (bodySize !== undefined) {
     h.set("content-type", "application/json");
@@ -139,7 +145,7 @@ function buildUpstreamHeaders(authKey: string | undefined, bodySize?: number): H
   h.set("accept", "*/*");
   h.set("x-opencode-client", "cli");
   h.set("x-opencode-project", "global");
-  h.set("x-opencode-session", `ses_${crypto.randomUUID()}`);
+  h.set("x-opencode-session", dailySessionId());
   h.set("x-opencode-request", `msg_${crypto.randomUUID()}`);
   return h;
 }
@@ -245,17 +251,64 @@ async function handleModels(env: Env): Promise<Response> {
   return new Response(JSON.stringify({ object: "list", data }), { headers: jsonHeaders() });
 }
 
-/** cline 上游请求头：账号 Key + CLI 客户端标识 */
-function buildClineHeaders(apiKey: string, bodySize?: number): Headers {
-  const h = new Headers();
-  if (bodySize !== undefined) {
-    h.set("content-type", "application/json");
-    h.set("content-length", String(bodySize));
+/** zen 上游合规化请求体（i-code v0.3.8 要求）：
+ * 1. 强制 stream: true（非流式直接拦截报错）
+ * 2. tools 必须存在、≥2 个且含 bash——缺失则自动注入最小化工具
+ */
+function prepareZenBody(bodyText: string): string {
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(bodyText) as Record<string, unknown>;
+  } catch {
+    return bodyText; // 非 JSON，原样透传
   }
-  h.set("authorization", `Bearer ${apiKey}`);
-  h.set("accept", "*/*");
-  h.set("x-client-type", "cline-cli");
-  return h;
+
+  // 1. 强制流式：非流式入口直接报错（不再静默改写/聚合）
+  if (body.stream !== true) {
+    throw new Error("OpenCode Free 通道仅支持流式请求（stream 必须为 true），请携带 \"stream\": true 后重试。");
+  }
+
+  // 2. tools 合规化
+  const tools = body.tools;
+  const toolsEmptyOrMissing = !Array.isArray(tools) || tools.length === 0;
+
+  const minimalBash = {
+    type: "function",
+    function: { name: "bash", description: "x", parameters: { type: "object", properties: {}, required: [] }, strict: false },
+  };
+  const minimalRead = {
+    type: "function",
+    function: { name: "read", description: "x", parameters: { type: "object", properties: {}, required: [] }, strict: false },
+  };
+
+  if (toolsEmptyOrMissing) {
+    body.tools = [minimalBash, minimalRead];
+  } else {
+    // 规范化扁平格式工具（旧版 {"type":"function","name":...} -> {"type":"function","function":{"name":...}}）
+    const normalized = tools.map((t: unknown) => {
+      const tool = t as Record<string, unknown>;
+      if (tool.function) return tool; // 已是标准嵌套格式
+      const name = tool.name as string | undefined;
+      if (!name) return tool;
+      const func: Record<string, unknown> = { name };
+      if (tool.description) func.description = tool.description;
+      if (tool.parameters) func.parameters = tool.parameters;
+      if (tool.strict) func.strict = tool.strict;
+      return { type: "function", function: func };
+    });
+
+    // 检查是否含 bash
+    const hasBash = normalized.some((t: Record<string, unknown>) =>
+      t.name === "bash" || (t.function as Record<string, unknown> | undefined)?.name === "bash"
+    );
+
+    let finalTools = normalized;
+    if (!hasBash) finalTools = [minimalBash, ...finalTools];
+    if (finalTools.length < 2) finalTools = [...finalTools, minimalRead];
+    body.tools = finalTools;
+  }
+
+  return JSON.stringify(body);
 }
 
 /** 按上游构造转发目标与请求参数 */
@@ -275,12 +328,14 @@ function buildUpstreamPost(
       },
     };
   }
+  // zen：应用合规化（强制流式 + tools 注入）
+  const compliantBody = prepareZenBody(bodyText);
   return {
     url: `${UPSTREAM_BASE}${path}`,
     init: {
       method: "POST",
-      headers: buildUpstreamHeaders(env.ZEN_KEY, bodyText.length),
-      body: bodyText,
+      headers: buildUpstreamHeaders(env.ZEN_KEY, compliantBody.length),
+      body: compliantBody,
     },
   };
 }
