@@ -470,7 +470,17 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
 
   const upstreamBody = JSON.stringify(parsed);
 
-  const target = buildUpstreamPost(route.upstream, env, "/chat/completions", upstreamBody);
+  let target: { url: string; init: RequestInit };
+  try {
+    target = buildUpstreamPost(route.upstream, env, "/chat/completions", upstreamBody);
+  } catch (e) {
+    // prepareZenBody 强制流式拦截（i-code v0.3.8：非流式直接 400）
+    const msg = e instanceof Error ? e.message : "invalid request";
+    if (msg.includes("仅支持流式")) {
+      return openaiError(msg, "invalid_request_error", "bad_request", 400);
+    }
+    return openaiError(msg, "invalid_request_error", null, 400);
+  }
   let upstream: Response;
   try {
     upstream = await fetch(target.url, target.init);
@@ -497,7 +507,12 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
           parsed.model = candidate;
           try {
             const retryBody = JSON.stringify(parsed);
-            const retryTarget = buildUpstreamPost(route.upstream, env, "/chat/completions", retryBody);
+            let retryTarget: { url: string; init: RequestInit };
+            try {
+              retryTarget = buildUpstreamPost(route.upstream, env, "/chat/completions", retryBody);
+            } catch (e2) {
+              return openaiError(e2 instanceof Error ? e2.message : "invalid request", "invalid_request_error", null, 400);
+            }
             upstream = await fetch(retryTarget.url, retryTarget.init);
           } catch {
             return openaiError(`Upstream request failed during failover.`, "api_error", null, 502);
